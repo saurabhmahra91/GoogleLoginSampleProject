@@ -1,21 +1,33 @@
-import time
-from flask import Flask, abort, session, redirect, request
-from google_auth_oauthlib.flow import Flow
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+from flask import Flask, abort, session, request, make_response, jsonify
+from flask import Flask
+from flask.json import dumps
+import jwt
+from jwt.exceptions import InvalidSignatureError
+import requests
+from flask_cors import CORS
+from oauthlib.oauth2 import WebApplicationClient
 import os
 from dotenv import load_dotenv
-import requests
-from google.oauth2 import id_token
-import google.auth.transport.requests#, cachecontrol
-import requests
-from pip._vendor import cachecontrol
+from werkzeug.utils import redirect
+from functools import wraps
+from json import loads
+from bson import json_util
 
 
 app = Flask("Google Login Sample App")
-app.secret_key = "saurabhmahrasecretkey" # to encrypt/decrypt session data
+# by default two servers running and communicating with each other is not allowed. this is to override it.
+cors = CORS(app)
+app.config['CORS_HEADERS'] = 'Content-Type'
+authclient = WebApplicationClient(os.getenv("client_id"))
 
-#loading env variables
+# to encrypt/decrypt session data. It's not required if you're not using sessions
+app.secret_key = "saurabhmahrasecretkey"
+
+# loading env variables
 load_dotenv()
-client_id=os.getenv("client_id")
+client_id = os.getenv("client_id")
 # client_secret=os.getenv("client_secret")
 # secret_key=os.getenv("secret_key")
 
@@ -23,70 +35,131 @@ client_id=os.getenv("client_id")
 # internally trying to make an attempt to open a file with name client_Secret as json. Download this file from google cloud console and save it in same directory as this file
 client_secret_file = os.path.join(os.getcwd(), "client_secret.json")
 
-flow = Flow.from_client_secrets_file(
-    client_secrets_file=client_secret_file,
-    scopes=["https://www.googleapis.com/auth/userinfo.profile", "https://www.googleapis.com/auth/userinfo.email", "openid"],
-    redirect_uri="http://127.0.0.1:5000/callback"
-)
 
-# allow google verification at http too (default behavior is to support https only)  
+# allow google verification at http too (default behavior is to support https only)
 os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
+GOOGLE_DISCOVERY_URL = "https://accounts.google.com/.well-known/openid-configuration"
 
-def login_required(function):
-    def wrapper(*args, **kwargs):
-        if "google_id" not in session:
-            return abort(401)
+
+def get_google_provider_cfg():
+    return requests.get(GOOGLE_DISCOVERY_URL).json()
+
+
+def token_required(function):
+    @wraps(function)
+    def decorated(*args, **kwargs):
+        if 'x-access-token' in request.headers:
+            token = request.headers['x-access-token']
         else:
-            return function()
-    return wrapper
+            return {"message": "missing user token"}, 401
+        try:
+            data = jwt.decode(token, os.getenv("SECRET_KEY"), algorithm="HS256")
+            from pymongo import MongoClient
+            client = MongoClient("localhost", 27017, maxPoolSize=50)
+            db = client.users
+            user_collection = db.users 
+            user = user_collection.find_one({"emailID":data["emailID"]})
+        except InvalidSignatureError:
+            return {"message": "invalid user token"}, 401
+        except:
+            return {"message": "authenticity of the user could not be verified"}, 401
 
-@app.route("/login")
-def login():
+        return function(user, *args, **kwargs)
+    return decorated
 
-    #state is a security feature. We create a random state before login and obtain a state from google after login (see the callback route), if both match we're good to go. 
-    authorization_url, state = flow.authorization_url()
-    session['state'] = state
-    print("auth url is-->", authorization_url)
-    print("state is-->", state)
-    return redirect(authorization_url)
+
+@app.route("/time")
+def get_current_time():
+    return {"time": datetime.now()}
+
+
+@app.route("/me")
+@token_required
+def get_logged_in_name(user):
+    return {"email": user.emailID}
+
 
 @app.route("/logout")
 def logout():
-    pass
+    return {
+        "name": "saurabh",
+        "fuckYou": True
+    }
 
-@app.route("/prohibited")
-@login_required
-def prohibited():
-    return "prohibited area"
 
-@app.route("/")
+@app.route("/login")
+def login():
+    # DO  NOT USE @token_required FOR THIS ROUTE
+    # FIND THE USER ACCORDING TO THE PROVIDED INFO
+    # ENCODE THE USER, AND OBTAIN A TOKEN. SET A TOKEN EXPIRATION TIME, SAY 5 DAYS
+    # DECODE THE TOKEN YOU JUST CREATED
+    # SEND THIS DECODED TOKEN BACK TO THE LOGGEDINUSER
+    return {
+        "name": "saurabh",
+        "loggedIn": True
+    }
+
+
+@app.route("/",  methods=["GET", "POST"])
 def index():
     return "<h1>Index Page</h1>"
 
 
-@app.route("/callback")
-def callback():
-    print("HELLOOOOOOOOOOOOOOOOOOO")
-    flow.fetch_token(authorization_response=request.url) #flask request acts like a "global variable"
-    if not session['state'] == request.args["state"]: #to stop csrf attacks
-        abort(500)
-    
-    # if flow.fetch_token worked fine, we will obtain the user credentials through flow.credentials 
-    credentials = flow.credentials
-    request_session = requests.session()
-    cached_session = cachecontrol.CacheControl(request_session)
-    
-    #for some reasons that i dont know, I was getting an error saying token used too early. I am assuming this is because I am running the backend on the same server and there might be some time offset b/n my computer and google's api server. This should not be the case in production environment!!. Try once with time.sleep() removed in your local machine.
-    # time.sleep(5)
+@app.route("/getLoggedInUser",  methods=["GET"])
+def get_logged_in_user():
+    if session["email"]:
+        return {"name": "Saurabh", "loggedIn": True}
+    else:
+        return {"loggedIn": False}
 
 
-    token_request = google.auth.transport.requests.Request(session=cached_session)
-    id_info = id_token.verify_oauth2_token(
-        id_token=credentials._id_token,
-        request=token_request,
-        audience=client_id,
-    )
-    return id_info
+
+@app.route("/googleToken",  methods=["POST"])
+def googleLogin():
+    # To verify once the tokens, do not send the userinfo with request
+    google_profile = request.get_json(silent=True)["googleData"]['profileObj']
+    email = google_profile["email"]
+    familyName = google_profile["familyName"]
+    givenName = google_profile["givenName"]
+    googleId = google_profile["googleId"]
+    imageUrl = google_profile["imageUrl"]
+    # INSERT THE USER INTO DATABASE AND CREATE A TOKEN
+    # FIND THE USER ACCORDING TO THE PROVIDED INFO
+    # ENCODE THE USER, AND OBTAIN A TOKEN. SET A TOKEN EXPIRATION TIME, SAY 5 DAYS
+    # DECODE THE TOKEN YOU JUST CREATED
+    # SEND THIS DECODED TOKEN BACK TO THE LOGGEDINUSER
+    from pymongo import MongoClient
+    client = MongoClient("localhost", 27017, maxPoolSize=50)
+    db = client.users
+    user_collection = db.users
+    print("client", client, type(client))
+    print("db", db, type(db))
+    print("user_collection", user_collection, type(user_collection))
+    a = user_collection.find({})
+    print("type(a)=",type(a))
+    print("type(user_collection.find())=",user_collection.find({}))
+    for i in a:
+        print(i)
+    # print(a = user_collection.find({}))
+    # print(db)
+    # print(client)
+    results = list(user_collection.find({"emailID": email}))
+    if len(results) > 0:
+        # EXISTING USER
+        found_user = user_collection.find_one({"emailID": email})
+        token = jwt.encode(loads(json_util.dumps(found_user)), os.getenv("secret_key"), algorithm='HS256')
+        return {"token": token}
+    else:
+        # NEW USER
+        #TODO Check for email verified
+        new_user = {
+            "firstName": givenName,
+            "emailID": email,
+            "lastName":familyName
+        }
+        user_collection.insert_one(new_user)
+        token = jwt.encode(loads(json_util.dumps(new_user)), os.getenv("secret_key"), algorithm='HS256')
+        return {"token": token}
 
 if __name__ == "__main__":
     app.run(debug=True)
